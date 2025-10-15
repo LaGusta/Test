@@ -42,7 +42,11 @@ authenticator = stauth.Authenticate(
 # ---------------------------
 st.title("🔐 Bilton – Geschützter Zugang")
 
-name, auth_status, username = authenticator.login("Anmeldung", "main")
+authenticator.login(location="main", key="Login")
+
+auth_status = st.session_state.get("authentication_status")
+username    = st.session_state.get("username")
+name        = st.session_state.get("name")
 
 if auth_status is False:
     st.error("Falsche Zugangsdaten.")
@@ -151,3 +155,4 @@ elif role == "viewer":
 
 # Komfort: Logout-Button in der Sidebar
 authenticator.logout("Abmelden", "sidebar")
+
