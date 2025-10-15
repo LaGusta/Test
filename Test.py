@@ -8,7 +8,17 @@ from datetime import datetime, timedelta, timezone
 
 import streamlit as st
 import streamlit_authenticator as stauth
-from passlib.hash import bcrypt
+
+import hashlib, hmac
+
+PEPPER = st.secrets.get("otp_pepper", "fallback-change-me")
+
+def _hash_otp(code: str) -> str:
+    # HMAC-SHA256 über (pepper + code)
+    return hashlib.sha256((PEPPER + code).encode("utf-8")).hexdigest()
+
+def _verify_otp_hash(code: str, digest: str) -> bool:
+    return hmac.compare_digest(_hash_otp(code), digest)
 
 # ---------------------------------------------------------
 # Grundkonfiguration
@@ -62,7 +72,7 @@ def create_and_store_otp(username: str, ttl_seconds: int = 300) -> str:
     """Erzeuge 6-stelligen Code, speichere nur den Hash + Ablauf im Session-State und gib den Klartext zurück (für Versand)."""
     code = "".join(secrets.choice(string.digits) for _ in range(6))
     entry = {
-        "hash": bcrypt.hash(code),
+        "hash": _hash_otp(code),
         "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat(),
         "attempts": 0,
         "last_sent": datetime.now(timezone.utc).isoformat(),
@@ -217,6 +227,7 @@ elif role == "viewer":
 
 # Komfort: Logout
 authenticator.logout("Abmelden", "sidebar")
+
 
 
 
