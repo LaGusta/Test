@@ -6,108 +6,13 @@ import qrcode
 import streamlit as st
 import streamlit_authenticator as stauth
 from io import BytesIO
+import smtplib, ssl, secrets, string, time
+from email.message import EmailMessage
+
+from passlib.hash import bcrypt
 
 st.set_page_config(page_title="Bilton Login", page_icon="🔐", layout="centered")
 
-# ---------------------------
-# 1) Konfiguration laden
-# ---------------------------
-AUTH = st.secrets["auth_config"]
-CREDS = st.secrets["credentials"]["usernames"]
-TOTP_SECRETS = st.secrets.get("totp", {})
-APP_META = st.secrets.get("app_meta", {})
-ISSUER = APP_META.get("issuer", "Streamlit App")
-APP_LABEL = APP_META.get("app_label", "Login")
-
-# streamlit-authenticator erwartet ein verschachteltes Dict:
-credentials = {"usernames": {}}
-for uname, data in CREDS.items():
-    # streamlit-authenticator möchte {password: <hash>, email:..., name:...}
-    credentials["usernames"][uname] = {
-        "name": data.get("name", uname),
-        "email": data.get("email", ""),
-        "password": data["password"],
-    }
-
-# Authenticator-Objekt (setzt auch Cookie)
-authenticator = stauth.Authenticate(
-    credentials=credentials,
-    cookie_name=AUTH["cookie_name"],
-    key=AUTH["cookie_key"],
-    cookie_expiry_days=AUTH.get("cookie_expiry_days", 1),
-)
-
-# ---------------------------
-# 2) Login-Formular
-# ---------------------------
-st.title("🔐 Bilton – Geschützter Zugang")
-
-authenticator.login(location="main", key="Login")
-
-auth_status = st.session_state.get("authentication_status")
-username    = st.session_state.get("username")
-name        = st.session_state.get("name")
-
-if auth_status is False:
-    st.error("Falsche Zugangsdaten.")
-    st.stop()
-elif auth_status is None:
-    st.info("Bitte Benutzername & Passwort eingeben.")
-    st.stop()
-
-# E-Mail aus deinen Credentials (oder eigener Benutzerquelle)
-user_email = st.secrets["credentials"]["usernames"][username]["email"]
-
-# 2. Faktor per E-Mail-OTP
-if "otp_ok" not in st.session_state or not st.session_state["otp_ok"]:
-    email_otp_step(username, user_email)
-    st.stop()
-
-# Ab hier: vollständig eingeloggt
-st.success(f"Eingeloggt als {name} ({username})")
-
-# Wenn wir hier sind: Passwort ok → nun 2FA erfordern
-# ---------------------------------------------------
-# Session-Init
-if "expires_at" not in st.session_state:
-    st.session_state.expires_at = None
-if "role" not in st.session_state:
-    st.session_state.role = CREDS[username].get("role", "user")
-
-# ---------------------------
-# 3) Session-Timeout prüfen
-# ---------------------------
-def touch_session(timeout_minutes: int):
-    # Sliding expiration: bei Aktivität neu setzen
-    st.session_state.expires_at = datetime.utcnow() + timedelta(minutes=timeout_minutes)
-
-def check_timeout():
-    if st.session_state.expires_at is None:
-        return
-    if datetime.utcnow() > st.session_state.expires_at:
-        # Abgelaufen → Logout + Info
-        st.warning("Session abgelaufen. Bitte erneut anmelden.")
-        authenticator.logout("Neu anmelden", "main")
-        st.stop()
-
-# Beim erstmaligen Eintritt nach Passwort-Anmeldung Timeout setzen
-if st.session_state.expires_at is None:
-    touch_session(AUTH.get("timeout_minutes", 20))
-
-# Bei jedem Run Timeout validieren (Idle-Kontrolle)
-check_timeout()
-
-# ---------------------------
-# 4) TOTP-2FA
-# ---------------------------
-import smtplib, ssl, secrets, string, time
-from email.message import EmailMessage
-from datetime import datetime, timedelta
-
-import streamlit as st
-from passlib.hash import bcrypt
-
-# --- OTP-Store: für Tests in Session; für Produktion: DB (Supabase/Postgres) ---
 def _otp_store_key(username): return f"otp_{username}"
 def create_and_store_otp(username, ttl_seconds=300):
     code = "".join(secrets.choice(string.digits) for _ in range(6))
@@ -210,6 +115,95 @@ def email_otp_step(username, email_address):
         else:
             st.warning("Bitte warte kurz, bevor du erneut sendest.")
 
+# ---------------------------
+# 1) Konfiguration laden
+# ---------------------------
+AUTH = st.secrets["auth_config"]
+CREDS = st.secrets["credentials"]["usernames"]
+TOTP_SECRETS = st.secrets.get("totp", {})
+APP_META = st.secrets.get("app_meta", {})
+ISSUER = APP_META.get("issuer", "Streamlit App")
+APP_LABEL = APP_META.get("app_label", "Login")
+
+# streamlit-authenticator erwartet ein verschachteltes Dict:
+credentials = {"usernames": {}}
+for uname, data in CREDS.items():
+    # streamlit-authenticator möchte {password: <hash>, email:..., name:...}
+    credentials["usernames"][uname] = {
+        "name": data.get("name", uname),
+        "email": data.get("email", ""),
+        "password": data["password"],
+    }
+
+# Authenticator-Objekt (setzt auch Cookie)
+authenticator = stauth.Authenticate(
+    credentials=credentials,
+    cookie_name=AUTH["cookie_name"],
+    key=AUTH["cookie_key"],
+    cookie_expiry_days=AUTH.get("cookie_expiry_days", 1),
+)
+
+# ---------------------------
+# 2) Login-Formular
+# ---------------------------
+st.title("🔐 Bilton – Geschützter Zugang")
+
+authenticator.login(location="main", key="Login")
+
+auth_status = st.session_state.get("authentication_status")
+username    = st.session_state.get("username")
+name        = st.session_state.get("name")
+
+if auth_status is False:
+    st.error("Falsche Zugangsdaten.")
+    st.stop()
+elif auth_status is None:
+    st.info("Bitte Benutzername & Passwort eingeben.")
+    st.stop()
+
+# E-Mail aus deinen Credentials (oder eigener Benutzerquelle)
+user_email = st.secrets["credentials"]["usernames"][username]["email"]
+
+# 2. Faktor per E-Mail-OTP
+if "otp_ok" not in st.session_state or not st.session_state["otp_ok"]:
+    email_otp_step(username, user_email)
+    st.stop()
+
+# Ab hier: vollständig eingeloggt
+st.success(f"Eingeloggt als {name} ({username})")
+
+# Wenn wir hier sind: Passwort ok → nun 2FA erfordern
+# ---------------------------------------------------
+# Session-Init
+if "expires_at" not in st.session_state:
+    st.session_state.expires_at = None
+if "role" not in st.session_state:
+    st.session_state.role = CREDS[username].get("role", "user")
+
+# ---------------------------
+# 3) Session-Timeout prüfen
+# ---------------------------
+def touch_session(timeout_minutes: int):
+    # Sliding expiration: bei Aktivität neu setzen
+    st.session_state.expires_at = datetime.utcnow() + timedelta(minutes=timeout_minutes)
+
+def check_timeout():
+    if st.session_state.expires_at is None:
+        return
+    if datetime.utcnow() > st.session_state.expires_at:
+        # Abgelaufen → Logout + Info
+        st.warning("Session abgelaufen. Bitte erneut anmelden.")
+        authenticator.logout("Neu anmelden", "main")
+        st.stop()
+
+# Beim erstmaligen Eintritt nach Passwort-Anmeldung Timeout setzen
+if st.session_state.expires_at is None:
+    touch_session(AUTH.get("timeout_minutes", 20))
+
+# Bei jedem Run Timeout validieren (Idle-Kontrolle)
+check_timeout()
+
+
 
 # Ab hier: Benutzer ist vollständig eingeloggt (PW + TOTP)
 # --------------------------------------------------------
@@ -227,6 +221,7 @@ elif role == "viewer":
 
 # Komfort: Logout-Button in der Sidebar
 authenticator.logout("Abmelden", "sidebar")
+
 
 
 
