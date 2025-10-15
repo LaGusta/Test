@@ -134,7 +134,7 @@ if not st.session_state.totp_ok:
             touch_session(AUTH.get("timeout_minutes", 20))  # bei Erfolg Session verlängern
             st.success("2-Faktor verifiziert.")
             time.sleep(0.5)
-            st.experimental_rerun()
+            st.rerun()
         else:
             st.error("Ungültiger TOTP-Code.")
             st.stop()
@@ -155,4 +155,5 @@ elif role == "viewer":
 
 # Komfort: Logout-Button in der Sidebar
 authenticator.logout("Abmelden", "sidebar")
+
 
