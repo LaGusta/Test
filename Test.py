@@ -55,11 +55,20 @@ elif auth_status is None:
     st.info("Bitte Benutzername & Passwort eingeben.")
     st.stop()
 
+# E-Mail aus deinen Credentials (oder eigener Benutzerquelle)
+user_email = st.secrets["credentials"]["usernames"][username]["email"]
+
+# 2. Faktor per E-Mail-OTP
+if "otp_ok" not in st.session_state or not st.session_state["otp_ok"]:
+    email_otp_step(username, user_email)
+    st.stop()
+
+# Ab hier: vollständig eingeloggt
+st.success(f"Eingeloggt als {name} ({username})")
+
 # Wenn wir hier sind: Passwort ok → nun 2FA erfordern
 # ---------------------------------------------------
 # Session-Init
-if "totp_ok" not in st.session_state:
-    st.session_state.totp_ok = False
 if "expires_at" not in st.session_state:
     st.session_state.expires_at = None
 if "role" not in st.session_state:
@@ -91,53 +100,116 @@ check_timeout()
 # ---------------------------
 # 4) TOTP-2FA
 # ---------------------------
-def build_otpauth_uri(secret: str, user: str) -> str:
-    # otpauth://totp/<Issuer>:<User>?secret=<SECRET>&issuer=<Issuer>&digits=6&period=30
-    # Achtung: spaces/sonderzeichen vermeiden – streamlit zeigt Label separat
-    issuer_clean = ISSUER.replace(" ", "%20")
-    label_clean = f"{APP_LABEL}-{user}".replace(" ", "%20")
-    return f"otpauth://totp/{issuer_clean}:{label_clean}?secret={secret}&issuer={issuer_clean}&digits=6&period=30"
+import smtplib, ssl, secrets, string, time
+from email.message import EmailMessage
+from datetime import datetime, timedelta
 
-def qr_image_from_uri(uri: str):
-    img = qrcode.make(uri)
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+import streamlit as st
+from passlib.hash import bcrypt
 
-user_totp_secret = TOTP_SECRETS.get(username)
+# --- OTP-Store: für Tests in Session; für Produktion: DB (Supabase/Postgres) ---
+def _otp_store_key(username): return f"otp_{username}"
+def create_and_store_otp(username, ttl_seconds=300):
+    code = "".join(secrets.choice(string.digits) for _ in range(6))
+    # Nur Hash speichern, nicht den Klartext-Code
+    entry = {
+        "hash": bcrypt.hash(code),
+        "expires_at": datetime.utcnow() + timedelta(seconds=ttl_seconds),
+        "attempts": 0,
+        "last_sent": datetime.utcnow(),
+    }
+    st.session_state[_otp_store_key(username)] = entry
+    return code
 
-st.divider()
-st.subheader("Zwei-Faktor-Authentifizierung (TOTP)")
-
-# Setup-Hinweis/QR nur anzeigen, wenn ein Secret existiert (wir verwalten es zentral)
-if user_totp_secret:
-    with st.expander("TOTP einrichten / QR-Code anzeigen"):
-        st.write("Scanne diesen QR-Code mit deiner Authenticator-App (Google/Microsoft Authenticator o.ä.).")
-        uri = build_otpauth_uri(user_totp_secret, username)
-        st.image(qr_image_from_uri(uri), caption="Authenticator-QR", use_column_width=False)
-        st.code(uri, language="text")
-else:
-    st.error("Für diesen Benutzer ist kein TOTP-Secret hinterlegt. Bitte wende dich an den Admin.")
-    authenticator.logout("Abmelden", "sidebar")
-    st.stop()
-
-if not st.session_state.totp_ok:
-    with st.form("totp_form"):
-        code = st.text_input("6-stelliger Code", max_chars=6)
-        ok = st.form_submit_button("Bestätigen")
+def verify_otp(username, code, max_attempts=5):
+    entry = st.session_state.get(_otp_store_key(username))
+    if not entry:
+        return False, "Kein Code angefordert."
+    if datetime.utcnow() > entry["expires_at"]:
+        return False, "Code abgelaufen."
+    if entry["attempts"] >= max_attempts:
+        return False, "Zu viele Fehlversuche. Bitte neuen Code anfordern."
+    entry["attempts"] += 1
+    ok = bcrypt.verify(code, entry["hash"])
     if ok:
-        totp = pyotp.TOTP(user_totp_secret)
-        # valid_window=1 erlaubt +/- 30s Toleranz
-        if code and totp.verify(code, valid_window=1):
-            st.session_state.totp_ok = True
-            touch_session(AUTH.get("timeout_minutes", 20))  # bei Erfolg Session verlängern
-            st.success("2-Faktor verifiziert.")
-            time.sleep(0.5)
+        # Einmal verwendbar
+        st.session_state.pop(_otp_store_key(username), None)
+        return True, None
+    return False, "Code ungültig."
+
+def can_resend(username, cooldown_seconds=30):
+    entry = st.session_state.get(_otp_store_key(username))
+    if not entry: return True
+    return (datetime.utcnow() - entry["last_sent"]).total_seconds() >= cooldown_seconds
+
+def mark_resent(username):
+    entry = st.session_state.get(_otp_store_key(username))
+    if entry:
+        entry["last_sent"] = datetime.utcnow()
+
+# --- E-Mail Versand ---
+def send_email_code(to_addr: str, code: str):
+    cfg = st.secrets["email"]
+    msg = EmailMessage()
+    msg["Subject"] = cfg.get("subject", "Dein Anmeldecode")
+    msg["From"] = cfg["from_addr"]
+    msg["To"] = to_addr
+    msg.set_content(
+        f"""Hallo,
+
+dein Einmalcode lautet: {code}
+
+Er ist 5 Minuten gültig. Wenn du die Anmeldung nicht gestartet hast, ignoriere diese E-Mail.
+
+– Bilton App
+"""
+    )
+    context = ssl.create_default_context()
+    with smtplib.SMTP(cfg["host"], cfg.get("port", 587)) as server:
+        if cfg.get("use_tls", True):
+            server.starttls(context=context)
+        server.login(cfg["user"], cfg["password"])
+        server.send_message(msg)
+
+# --- Nach Passwort-Login: E-Mail-OTP Schritt ---
+def email_otp_step(username, email_address):
+    st.subheader("Zweiter Schritt: E-Mail-Code")
+    # Code erzeugen & senden (nur wenn noch keiner existiert)
+    if _otp_store_key(username) not in st.session_state:
+        code = create_and_store_otp(username, ttl_seconds=300)
+        try:
+            send_email_code(email_address, code)
+            st.success(f"Ein Code wurde an {email_address} gesendet (gültig 5 Minuten).")
+        except Exception as e:
+            st.error("Fehler beim Versand des Codes. Bitte später erneut versuchen.")
+            st.stop()
+
+    # Formular für Codeeingabe
+    with st.form("otp_form"):
+        otp = st.text_input("6-stelligen Code eingeben", max_chars=6)
+        submitted = st.form_submit_button("Bestätigen")
+    if submitted:
+        ok, err = verify_otp(username, otp)
+        if ok:
+            st.session_state["otp_ok"] = True
+            st.success("Verifizierung erfolgreich.")
             st.rerun()
         else:
-            st.error("Ungültiger TOTP-Code.")
-            st.stop()
+            st.error(err)
+
+    # Resend mit Cooldown
+    if st.button("Code erneut senden"):
+        if can_resend(username, cooldown_seconds=30):
+            code = create_and_store_otp(username, ttl_seconds=300)
+            try:
+                send_email_code(email_address, code)
+                mark_resent(username)
+                st.info("Neuer Code wurde gesendet.")
+            except Exception:
+                st.error("Versand fehlgeschlagen.")
+        else:
+            st.warning("Bitte warte kurz, bevor du erneut sendest.")
+
 
 # Ab hier: Benutzer ist vollständig eingeloggt (PW + TOTP)
 # --------------------------------------------------------
@@ -155,5 +227,6 @@ elif role == "viewer":
 
 # Komfort: Logout-Button in der Sidebar
 authenticator.logout("Abmelden", "sidebar")
+
 
 
